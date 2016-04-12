@@ -56,13 +56,9 @@ class FileWriterActor(path: String) extends Actor {
   import DataActor._
   import FileWriterActor._
 
-  val options = Set[OpenOption](StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-  val p = Paths.get(path)
-  //val fileChannel = FileChannel.open(p, options.asJava)
   val log = Logging(context.system, this)
   var outputString = ""
   
-  //val f = scala.tools.nsc.io.File(path, options.asJava)
   override def preStart(): Unit = {
   }
 
@@ -116,51 +112,53 @@ class DataActor(sink: ActorRef) extends Actor {
     //println("Yo, I am restarting...")
     super.preRestart(reason, message)
   }
- 
+
   override def postRestart(reason: Throwable) = {
     //println("...restart completed!")
     super.postRestart(reason)
   }
-  
+
   //override def persistenceId = "data-actor"
 
   val log = Logging(context.system, this)
   
   // key: id of tweet value: hastags
-  var tweetMap = TreeMap[ZonedDateTime, Set[String]]()
+  var edgesMap = Map[(String, String), ZonedDateTime]()
   // key: hastag value: degree
   var degreeMap = Map[String, Int]()
 
-  var upperBoundWindow = ZonedDateTime.now().minusYears(1)
+  var upperBoundWindow = ZonedDateTime.now().minusYears(30)
   var lowerBoundWindow = upperBoundWindow.minusSeconds(60)
 
   def receive = {
     case Tweet (createdAt, hashtagset) =>
       if ((createdAt isAfter lowerBoundWindow) && hashtagset.size > 1) {
-        tweetMap = tweetMap + (createdAt -> hashtagset)
         // get edges
-        val edges = combinations(hashtagset.toList, 2)
-        // get increased number of degrees
-        val inc = edges.flatten.groupBy(identity).mapValues(_.size)
-        //println(inc)
+        val sortedTags = hashtagset.toList.sorted
+        val edges = combinations(sortedTags, 2)
+        val edgeTuples = edges.map(l => (l(0), l(1)))
+        val kvs = edgeTuples.map((_ -> createdAt))
+        val allEdges = edgesMap.keys.toSet
+        val newEdges = edgeTuples.filter(!allEdges.contains(_))
+        edgesMap = edgesMap ++ kvs
+        val inc = newEdges.flatMap(x => List(x._1, x._2)).groupBy(identity).mapValues(_.size)
         // increment degree for each vertices
         degreeMap = degreeMap ++ inc.map( kv => ( kv._1 -> (degreeMap.getOrElse(kv._1, 0)+kv._2) ) )
       }
       if (createdAt isAfter upperBoundWindow) {
         upperBoundWindow = createdAt
         lowerBoundWindow = upperBoundWindow.minusSeconds(60)
-
-        val removedHashtagSet = tweetMap.takeWhile(p => lowerBoundWindow.isAfter(p._1)).map(p => p._2)
-        val removedEdges = removedHashtagSet.map(e => combinations(e.toList, 2)).flatten
-        val dec = removedEdges.flatten.groupBy(identity).mapValues(_.size)
+        val (removedEdgesMap, updatedEdgesMap) = edgesMap.partition(p => lowerBoundWindow.compareTo(p._2) > 0)
+        val removedEdges = removedEdgesMap.map(p => p._1).toList
+        val dec = removedEdges.flatMap(x => List(x._1, x._2)).groupBy(identity).mapValues(_.size)
         // decrement degress for removed vertices
-        degreeMap = degreeMap ++ dec.map( kv => ( kv._1 -> (degreeMap(kv._1)-kv._2) ) )
+        degreeMap = degreeMap ++ dec.map( kv => ( kv._1 -> (degreeMap(kv._1) - kv._2) ) )
         // remove unconnected vertices
         degreeMap = degreeMap.filter(_._2 > 0)
         // remove tweets falls out of window
-        tweetMap = tweetMap.dropWhile(p => lowerBoundWindow.isAfter(p._1))
+        edgesMap = updatedEdgesMap
       }
-      
+
       val future = (sink ? 
         { if (degreeMap.size == 0) CurrentAverageDegree(0.0) 
           else CurrentAverageDegree(degreeMap.values.foldLeft(0)(_ + _).toDouble / degreeMap.size.toDouble) }
@@ -203,9 +201,7 @@ class TweetDistributorActor(dataActor: ActorRef, displayActor: ActorRef) extends
         val formatter = DateTimeFormatter.ofPattern("E MMM dd HH:mm:ss Z yyyy");
         val hashtagset = (json \ "entities" \ "hashtags" \\ "text").map(e => e.toString).toSet
         val created_at = ZonedDateTime.parse((json \ "created_at").get.toString.replace("\"", ""), formatter);
-        val future = (dataActor ? Tweet(created_at, hashtagset))
-        //dataActor ! Tweet(created_at, hashtagset)
-        future pipeTo sender
+        (dataActor ? Tweet(created_at, hashtagset)) pipeTo sender
       } catch {
         case e: Exception => log.warning("Exception: " + e + "\n" + json)
       }
@@ -325,7 +321,7 @@ class SupervisorActor(inputPath: String, outputPath: String) extends Actor {
       context.watch(readerActor)
       context.watch(dataActor)
       context.watch(displayActor)
-      
+
     case Terminated(who) =>
       log.warning("Terminated " + who)
       context.system.shutdown()
@@ -336,6 +332,7 @@ class SupervisorActor(inputPath: String, outputPath: String) extends Actor {
 class Listener extends Actor {
   def receive = {
     case d: DeadLetter => //println(d)
+      println("Another dead letter")
   }
 }
 
