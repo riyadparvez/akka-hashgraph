@@ -172,7 +172,7 @@ class DataActor(sink: ActorRef) extends PersistentActor {
   
   val receiveRecover: Receive = {
     case evt: Evt                                 => updateState(evt)
-    case SnapshotOffer(_, snapshot: GraphState) => state = snapshot
+    case SnapshotOffer(_, snapshot: GraphState)   => state = snapshot
   }
 
   val receiveCommand: Receive = {
@@ -182,19 +182,15 @@ class DataActor(sink: ActorRef) extends PersistentActor {
         updateState(event)
         context.system.eventStream.publish(event)
       }
-      val future = (sink ? 
-        { if (degreeMap.size == 0) CurrentAverageDegree(0.0) 
-          else CurrentAverageDegree(degreeMap.values.foldLeft(0)(_ + _).toDouble / degreeMap.size.toDouble) }
+      //log.debug(s"Recieved command")
+      val future = (sink ?
+        { if (state.degreeMap.size == 0) CurrentAverageDegree(0.0) 
+          else CurrentAverageDegree(state.degreeMap.values.foldLeft(0)(_ + _).toDouble / state.degreeMap.size.toDouble) }
         )
       future pipeTo sender
     case "snap"  => saveSnapshot(state)
     case "print" => println(state)
   }
-  /**
-  def receive = {
-    case Tweet (createdAt, hashtagset) =>
-  }
-  */
 }
 
 object TweetDistributorActor {
@@ -217,7 +213,8 @@ class TweetDistributorActor(dataActor: ActorRef, displayActor: ActorRef) extends
         val formatter = DateTimeFormatter.ofPattern("E MMM dd HH:mm:ss Z yyyy");
         val hashtagset = (json \ "entities" \ "hashtags" \\ "text").map(e => e.toString).toSet
         val created_at = ZonedDateTime.parse((json \ "created_at").get.toString.replace("\"", ""), formatter);
-        (dataActor ? Tweet(created_at, hashtagset)) pipeTo sender
+        (dataActor ? Cmd(Tweet(created_at, hashtagset))) pipeTo sender
+        //log.debug("Add new tweet to graph")
       } catch {
         case e: Exception => log.warning("Exception: " + e + "\n" + json)
       }
@@ -235,7 +232,8 @@ class CleanerActor(dataActor: ActorRef, displayActor: ActorRef) extends Actor {
 
   val log = Logging(context.system, this)
   val watched = scala.collection.mutable.ArrayBuffer.empty[ActorRef]
-  
+  var count = 0
+
   def receive = {
     case Line(line) =>
       try {
@@ -247,6 +245,9 @@ class CleanerActor(dataActor: ActorRef, displayActor: ActorRef) extends Actor {
           context.watch(distributor)
           watched += distributor
           distributor ! JsonObject(json)
+          count = count + 1
+          sender() ! Done
+          //log.debug(s"Got tweet: $count")
         }
       } catch {
         case e: Exception => log.warning("Exception: " + e)
@@ -254,7 +255,7 @@ class CleanerActor(dataActor: ActorRef, displayActor: ActorRef) extends Actor {
     case Terminated(who) =>
       watched -= who
       if (watched.isEmpty) {
-        context.stop(self)
+        //context.stop(self)
         log.info("ALL DEAD")
       }
   }
@@ -293,14 +294,24 @@ class ReaderActor(dataActor: ActorRef, displayActor: ActorRef) extends Actor {
   val log = Logging(context.system, this)
   val child = context.actorOf(Props(classOf[CleanerActor], dataActor, displayActor))
   context.watch(child)
+  var count = 0
 
   def receive = {
     case FilePath(path) =>
       fromFile(path)
         .getLines
-        .foreach { line => child ! Line(line) }
+        .foreach { line => child ! Line(line); count = count + 1 }
+      child ! akka.actor.PoisonPill
+      //log.debug("Sent all lines")
+    case Done =>
+      count = count - 1
+      if (count == 0) {
+        //log.debug(s"${self.path.name} Processed all tweets")
+        //context.stop(self)
+      }
+      //log.debug(s"Remaining: $count")
     case Terminated(who) =>
-      context.stop(self)
+      //context.stop(self)
   }
 }
 
@@ -324,7 +335,8 @@ class SupervisorActor(inputPath: String, outputPath: String) extends Actor {
   import SupervisorActor._
 
   val log = Logging(context.system, this)
-
+  val watched = scala.collection.mutable.ArrayBuffer.empty[ActorRef]
+  
   def receive = {
     case TheSecretFateOfAllLife =>
       val displayActor = context.actorOf(Props(classOf[FileWriterActor], outputPath), name = "displayActor")
@@ -338,18 +350,24 @@ class SupervisorActor(inputPath: String, outputPath: String) extends Actor {
       context.watch(readerActor)
       context.watch(dataActor)
       context.watch(displayActor)
+      log.info("Started all top actors")
 
     case Terminated(who) =>
       log.warning("Terminated " + who)
-      context.system.shutdown()
+      //watched -= who
+      //if (watched.isEmpty) {
+        context.stop(self)
+        log.info("ALL DEAD")
+        context.system.shutdown()
+      //}
     case _ => //context.system.shutdown() //context.stop(self)
   }
 }
 
 class Listener extends Actor {
   def receive = {
-    case d: DeadLetter => //println(d)
-      println("Another dead letter")
+    case d: DeadLetter =>
+      println(s"Another dead letter: $d")
   }
 }
 
@@ -360,9 +378,15 @@ object Main extends App {
     println("")
   }
   val config = ConfigFactory.load()
-     .withValue("akka.loglevel", ConfigValueFactory.fromAnyRef("INFO"))
-     .withValue("akka.stdout-loglevel", ConfigValueFactory.fromAnyRef("INFO"))
-
+     //.withValue("akka.loglevel", ConfigValueFactory.fromAnyRef("INFO"))
+     //.withValue("akka.stdout-loglevel", ConfigValueFactory.fromAnyRef("INFO"))
+     .withValue("akka.loglevel", ConfigValueFactory.fromAnyRef("DEBUG"))
+     .withValue("akka.stdout-loglevel", ConfigValueFactory.fromAnyRef("DEBUG"))
+     .withValue("akka.persistence.journal.plugin", ConfigValueFactory.fromAnyRef("akka.persistence.journal.leveldb"))
+     .withValue("akka.persistence.snapshot-store.plugin", ConfigValueFactory.fromAnyRef("akka.persistence.snapshot-store.local"))
+     .withValue("akka.persistence.journal.leveldb.dir", ConfigValueFactory.fromAnyRef("target/example/journal"))
+     .withValue("akka.persistence.snapshot-store.local.dir", ConfigValueFactory.fromAnyRef("target/example/snapshots"))
+     
   val system = ActorSystem("HashGraphSystem", config)
   // default Actor constructor
   val supervisorActor = system.actorOf(Props(classOf[SupervisorActor], args(0), args(1)), name = "riyad")
