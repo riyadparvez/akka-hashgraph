@@ -58,7 +58,7 @@ class FileWriterActor(path: String) extends Actor {
 
   val log = Logging(context.system, this)
   var outputString = ""
-  
+
   override def preStart(): Unit = {
   }
 
@@ -72,7 +72,7 @@ class FileWriterActor(path: String) extends Actor {
       sender ! Done
       //log.info("Sent SinkDone")
   }
-  
+
   override def postStop() {
     //f.close()
     new PrintWriter(path) { write(outputString); close() }
@@ -85,12 +85,10 @@ object DataActor {
   case object UpdateDone
 }
 
-class DataActor(sink: ActorRef) extends Actor {
-  import akka.pattern.ask
-  import scala.concurrent.duration._
-  import DataActor._
-  import FileWriterActor._
-  
+case class Cmd(tweet: DataActor.Tweet)
+case class Evt(tweet: DataActor.Tweet)
+
+case class GraphState(var edgesMap: Map[(String, String), ZonedDateTime], var degreeMap: Map[String, Int], var lowerBoundWindow: ZonedDateTime, var upperBoundWindow: ZonedDateTime) {
   def flatMapSublists[A,B](ls: List[A])(f: (List[A]) => List[B]): List[B] = 
     ls match {
       case Nil => Nil
@@ -102,10 +100,49 @@ class DataActor(sink: ActorRef) extends Actor {
     else flatMapSublists(ls) { sl =>
       combinations(sl.tail, n - 1) map {sl.head :: _}
     }
-    
-  implicit def dateTimeOrdering: Ordering[ZonedDateTime] = Ordering.fromLessThan(_ isBefore _)
-  implicit val timeout = Timeout(100.seconds)
 
+  implicit def dateTimeOrdering: Ordering[ZonedDateTime] = Ordering.fromLessThan(_ isBefore _)
+
+  def updated(evt: Evt): GraphState = {
+    val DataActor.Tweet(createdAt, hashtagset) = evt.tweet
+    if ((createdAt isAfter lowerBoundWindow) && hashtagset.size > 1) {
+      // get edges
+      val sortedTags = hashtagset.toList.sorted
+      val edges = combinations(sortedTags, 2)
+      val edgeTuples = edges.map(l => (l(0), l(1)))
+      val kvs = edgeTuples.map((_ -> createdAt))
+      val allEdges = edgesMap.keys.toSet
+      val newEdges = edgeTuples.filter(!allEdges.contains(_))
+      edgesMap = edgesMap ++ kvs
+      val inc = newEdges.flatMap(x => List(x._1, x._2)).groupBy(identity).mapValues(_.size)
+      // increment degree for each vertices
+      degreeMap = degreeMap ++ inc.map( kv => ( kv._1 -> (degreeMap.getOrElse(kv._1, 0)+kv._2) ) )
+    }
+    if (createdAt isAfter upperBoundWindow) {
+      upperBoundWindow = createdAt
+      lowerBoundWindow = upperBoundWindow.minusSeconds(60)
+      val (removedEdgesMap, updatedEdgesMap) = edgesMap.partition(p => lowerBoundWindow.compareTo(p._2) > 0)
+      val removedEdges = removedEdgesMap.map(p => p._1).toList
+      val dec = removedEdges.flatMap(x => List(x._1, x._2)).groupBy(identity).mapValues(_.size)
+      // decrement degress for removed vertices
+      degreeMap = degreeMap ++ dec.map( kv => ( kv._1 -> (degreeMap(kv._1) - kv._2) ) )
+      // remove unconnected vertices
+      degreeMap = degreeMap.filter(_._2 > 0)
+      // remove tweets falls out of window
+      edgesMap = updatedEdgesMap
+    }
+    this
+  }
+}
+
+class DataActor(sink: ActorRef) extends PersistentActor {
+  import akka.pattern.ask
+  import scala.concurrent.duration._
+  import DataActor._
+  import FileWriterActor._
+
+  implicit val timeout = Timeout(100.seconds)
+  
   //override def preStart() = println("Yo, I am alive!")
   //override def postStop() = println("Goodbye world!")
   override def preRestart(reason: Throwable, message: Option[Any]) = {
@@ -118,8 +155,7 @@ class DataActor(sink: ActorRef) extends Actor {
     super.postRestart(reason)
   }
 
-  //override def persistenceId = "data-actor"
-
+  override def persistenceId = "data-actor"
   val log = Logging(context.system, this)
   
   // key: id of tweet value: hastags
@@ -129,56 +165,36 @@ class DataActor(sink: ActorRef) extends Actor {
 
   var upperBoundWindow = ZonedDateTime.now().minusYears(30)
   var lowerBoundWindow = upperBoundWindow.minusSeconds(60)
+  var state = GraphState(edgesMap, degreeMap, upperBoundWindow, upperBoundWindow.minusSeconds(60))
 
-  def receive = {
-    case Tweet (createdAt, hashtagset) =>
-      if ((createdAt isAfter lowerBoundWindow) && hashtagset.size > 1) {
-        // get edges
-        val sortedTags = hashtagset.toList.sorted
-        val edges = combinations(sortedTags, 2)
-        val edgeTuples = edges.map(l => (l(0), l(1)))
-        val kvs = edgeTuples.map((_ -> createdAt))
-        val allEdges = edgesMap.keys.toSet
-        val newEdges = edgeTuples.filter(!allEdges.contains(_))
-        edgesMap = edgesMap ++ kvs
-        val inc = newEdges.flatMap(x => List(x._1, x._2)).groupBy(identity).mapValues(_.size)
-        // increment degree for each vertices
-        degreeMap = degreeMap ++ inc.map( kv => ( kv._1 -> (degreeMap.getOrElse(kv._1, 0)+kv._2) ) )
-      }
-      if (createdAt isAfter upperBoundWindow) {
-        upperBoundWindow = createdAt
-        lowerBoundWindow = upperBoundWindow.minusSeconds(60)
-        val (removedEdgesMap, updatedEdgesMap) = edgesMap.partition(p => lowerBoundWindow.compareTo(p._2) > 0)
-        val removedEdges = removedEdgesMap.map(p => p._1).toList
-        val dec = removedEdges.flatMap(x => List(x._1, x._2)).groupBy(identity).mapValues(_.size)
-        // decrement degress for removed vertices
-        degreeMap = degreeMap ++ dec.map( kv => ( kv._1 -> (degreeMap(kv._1) - kv._2) ) )
-        // remove unconnected vertices
-        degreeMap = degreeMap.filter(_._2 > 0)
-        // remove tweets falls out of window
-        edgesMap = updatedEdgesMap
-      }
+  def updateState(event: Evt): Unit =
+    state = state.updated(event)
+  
+  val receiveRecover: Receive = {
+    case evt: Evt                                 => updateState(evt)
+    case SnapshotOffer(_, snapshot: GraphState) => state = snapshot
+  }
 
+  val receiveCommand: Receive = {
+    case Cmd(tweet) =>
+      persist(Evt(tweet))(updateState)
+      persist(Evt(tweet)) { event =>
+        updateState(event)
+        context.system.eventStream.publish(event)
+      }
       val future = (sink ? 
         { if (degreeMap.size == 0) CurrentAverageDegree(0.0) 
           else CurrentAverageDegree(degreeMap.values.foldLeft(0)(_ + _).toDouble / degreeMap.size.toDouble) }
         )
       future pipeTo sender
-      /**
-      future onComplete { 
-         case scala.util.Success(bla) => sender() ! UpdateDone
-         case scala.util.Failure(t) => println("An error has occured: " + t.getMessage)
-      }
-      */
-      /**
-      future onSuccess {
-        case result =>  { 
-          sender ! UpdateDone
-          log.info("Sent UpdateDone")
-        }
-      }
-      */
+    case "snap"  => saveSnapshot(state)
+    case "print" => println(state)
   }
+  /**
+  def receive = {
+    case Tweet (createdAt, hashtagset) =>
+  }
+  */
 }
 
 object TweetDistributorActor {
@@ -226,6 +242,7 @@ class CleanerActor(dataActor: ActorRef, displayActor: ActorRef) extends Actor {
         val json = Json.parse(line)
         val limitOption = (json \ "limit").asOpt[JsObject]
         if (!limitOption.isDefined) {
+          // Creating new actor for every tweet, great for concurrency, may be has overhead of creating new actor
           val distributor = context.actorOf(Props(classOf[TweetDistributorActor], dataActor, displayActor))
           context.watch(distributor)
           watched += distributor
@@ -338,13 +355,14 @@ class Listener extends Actor {
 
 object Main extends App {
   import SupervisorActor._
-  
+
   if (args.length != 2) {
     println("")
   }
   val config = ConfigFactory.load()
      .withValue("akka.loglevel", ConfigValueFactory.fromAnyRef("INFO"))
      .withValue("akka.stdout-loglevel", ConfigValueFactory.fromAnyRef("INFO"))
+
   val system = ActorSystem("HashGraphSystem", config)
   // default Actor constructor
   val supervisorActor = system.actorOf(Props(classOf[SupervisorActor], args(0), args(1)), name = "riyad")

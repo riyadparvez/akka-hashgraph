@@ -1,6 +1,6 @@
 lazy val root = (project in file(".")).
   settings(
-    name := "insight-test",
+    name := "akka-hashgraph",
     version := "1.0",
     scalaVersion := "2.11.8"
   )
