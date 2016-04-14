@@ -110,22 +110,22 @@ case class GraphState(var edgesMap: Map[(String, String), ZonedDateTime], var de
       val sortedTags = hashtagset.toList.sorted
       val edges = combinations(sortedTags, 2)
       val edgeTuples = edges.map(l => (l(0), l(1)))
-      val kvs = edgeTuples.map((_ -> createdAt))
+      val kvs = edgeTuples.map(_ -> createdAt)
       val allEdges = edgesMap.keys.toSet
       val newEdges = edgeTuples.filter(!allEdges.contains(_))
       edgesMap = edgesMap ++ kvs
       val inc = newEdges.flatMap(x => List(x._1, x._2)).groupBy(identity).mapValues(_.size)
       // increment degree for each vertices
-      degreeMap = degreeMap ++ inc.map( kv => ( kv._1 -> (degreeMap.getOrElse(kv._1, 0)+kv._2) ) )
+      degreeMap = degreeMap ++ inc.map( kv => kv._1 -> (degreeMap.getOrElse(kv._1, 0)+kv._2) )
     }
     if (createdAt isAfter upperBoundWindow) {
       upperBoundWindow = createdAt
       lowerBoundWindow = upperBoundWindow.minusSeconds(60)
       val (removedEdgesMap, updatedEdgesMap) = edgesMap.partition(p => lowerBoundWindow.compareTo(p._2) > 0)
-      val removedEdges = removedEdgesMap.map(p => p._1).toList
+      val removedEdges = removedEdgesMap.keys.toList
       val dec = removedEdges.flatMap(x => List(x._1, x._2)).groupBy(identity).mapValues(_.size)
       // decrement degress for removed vertices
-      degreeMap = degreeMap ++ dec.map( kv => ( kv._1 -> (degreeMap(kv._1) - kv._2) ) )
+      degreeMap = degreeMap ++ dec.map( kv => kv._1 -> (degreeMap(kv._1) - kv._2) )
       // remove unconnected vertices
       degreeMap = degreeMap.filter(_._2 > 0)
       // remove tweets falls out of window
@@ -158,9 +158,9 @@ class DataActor(sink: ActorRef) extends PersistentActor {
   override def persistenceId = "data-actor"
   val log = Logging(context.system, this)
   
-  // key: id of tweet value: hastags
+  // key: id of tweet value: hashtags
   var edgesMap = Map[(String, String), ZonedDateTime]()
-  // key: hastag value: degree
+  // key: hashtag value: degree
   var degreeMap = Map[String, Int]()
 
   var upperBoundWindow = ZonedDateTime.now().minusYears(30)
@@ -183,10 +183,10 @@ class DataActor(sink: ActorRef) extends PersistentActor {
         context.system.eventStream.publish(event)
       }
       //log.debug(s"Recieved command")
-      val future = (sink ?
-        { if (state.degreeMap.size == 0) CurrentAverageDegree(0.0) 
-          else CurrentAverageDegree(state.degreeMap.values.foldLeft(0)(_ + _).toDouble / state.degreeMap.size.toDouble) }
-        )
+      val future = sink ? {
+        if (state.degreeMap.isEmpty) CurrentAverageDegree(0.0)
+        else CurrentAverageDegree(state.degreeMap.values.sum.toDouble / state.degreeMap.size.toDouble)
+      }
       future pipeTo sender
     case "snap"  => saveSnapshot(state)
     case "print" => println(state)
@@ -210,11 +210,10 @@ class TweetDistributorActor(dataActor: ActorRef, displayActor: ActorRef) extends
   def receive = {
     case JsonObject(json) =>
       try {
-        val formatter = DateTimeFormatter.ofPattern("E MMM dd HH:mm:ss Z yyyy");
+        val formatter = DateTimeFormatter.ofPattern("E MMM dd HH:mm:ss Z yyyy")
         val hashtagset = (json \ "entities" \ "hashtags" \\ "text").map(e => e.toString).toSet
-        val created_at = ZonedDateTime.parse((json \ "created_at").get.toString.replace("\"", ""), formatter);
+        val created_at = ZonedDateTime.parse((json \ "created_at").get.toString.replace("\"", ""), formatter)
         (dataActor ? Cmd(Tweet(created_at, hashtagset))) pipeTo sender
-        //log.debug("Add new tweet to graph")
       } catch {
         case e: Exception => log.warning("Exception: " + e + "\n" + json)
       }
@@ -239,7 +238,7 @@ class CleanerActor(dataActor: ActorRef, displayActor: ActorRef) extends Actor {
       try {
         val json = Json.parse(line)
         val limitOption = (json \ "limit").asOpt[JsObject]
-        if (!limitOption.isDefined) {
+        if (limitOption.isEmpty) {
           // Creating new actor for every tweet, great for concurrency, may be has overhead of creating new actor
           val distributor = context.actorOf(Props(classOf[TweetDistributorActor], dataActor, displayActor))
           context.watch(distributor)
@@ -256,7 +255,6 @@ class CleanerActor(dataActor: ActorRef, displayActor: ActorRef) extends Actor {
       watched -= who
       if (watched.isEmpty) {
         //context.stop(self)
-        log.info("ALL DEAD")
       }
   }
 }
@@ -301,7 +299,7 @@ class ReaderActor(dataActor: ActorRef, displayActor: ActorRef) extends Actor {
       fromFile(path)
         .getLines
         .foreach { line => child ! Line(line); count = count + 1 }
-      child ! akka.actor.PoisonPill
+      //child ! akka.actor.PoisonPill
       //log.debug("Sent all lines")
     case Done =>
       count = count - 1
@@ -354,12 +352,12 @@ class SupervisorActor(inputPath: String, outputPath: String) extends Actor {
 
     case Terminated(who) =>
       log.warning("Terminated " + who)
-      //watched -= who
-      //if (watched.isEmpty) {
-        context.stop(self)
+      watched -= who
+      context.system.terminate()
+      if (watched.isEmpty) {
+        //context.stop(self)
         log.info("ALL DEAD")
-        context.system.shutdown()
-      //}
+      }
     case _ => //context.system.shutdown() //context.stop(self)
   }
 }
@@ -367,7 +365,7 @@ class SupervisorActor(inputPath: String, outputPath: String) extends Actor {
 class Listener extends Actor {
   def receive = {
     case d: DeadLetter =>
-      println(s"Another dead letter: $d")
+      //println(s"Another dead letter: $d")
   }
 }
 
